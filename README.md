@@ -12,6 +12,7 @@ To train the file, change parameters in train function, and compare the results 
 Install all requirements packages in requirements.txt
 
 ```bash
-python train.py
+python Tx_encoder.py
 ```
+
 
