@@ -1,17 +1,17 @@
-import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
-# from generate_channel import generate_correlated_CSI
+from generate_corr_csi import generate_channel_data
 torch.manual_seed(42)
 
 """
-Adaptive Modulation
-Robustness test - time varying CSI 
-"""
+Adaptive to time varying CSI
+Adaptive to tx-rx distances
+Do robustness test - train with non-mismatch csi and test mismatch csi
+"""  
 class SpatialAttention(nn.Module):
     """
     Find most correlated featrure spatially, CSI input
@@ -43,7 +43,7 @@ class ChannelAttention(nn.Module):
         # Shared MLP for both pooled features
         self.mlp = nn.Sequential(
             nn.Linear(channels, channels // reduction_ratio),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(channels // reduction_ratio, channels)
         )
         
@@ -76,10 +76,10 @@ class ResidualBlock(nn.Module):
         super(ResidualBlock, self).__init__()
         self.conv_block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(out_channels, out_channels),
             nn.LeakyReLU(0.2),
             nn.Conv2d(out_channels, out_channels, kernel_size=1, padding=0),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(out_channels, out_channels),
             nn.LeakyReLU(0.2)
         )
         # If input and output channels don't match, use a 1x1 conv to match dimensions
@@ -126,12 +126,13 @@ class SymbolLevelPrecodingNetwork(nn.Module):
 
         # Learnable SNR-to-power mapping
         self.snr_to_power = nn.Sequential(
-            nn.Linear(1, 32),
+            nn.Linear(2, 32),       # snr (snr for each batch), channel variance
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
-            nn.Sigmoid()
+            # nn.Sigmoid()
+            nn.Softplus()
         )
 
         # Neural network layers for joint channel state and symbol processing
@@ -142,13 +143,21 @@ class SymbolLevelPrecodingNetwork(nn.Module):
             nn.Linear(32, num_users * num_users)  # Match channel matrix size
         )
 
-        # Input channels: 2 (H_real, H_imag) + num_users (symbol spatial maps)  1 (snr_map)
-        input_channels = 2 + 2 + 1 # 5
+        self.correlation_processor = nn.Sequential(
+            nn.Linear(num_users * num_users, 64),  # *2 for real and imag parts
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, num_users * num_users)
+        )
+
+        # Input channels: 2 (H_real, H_imag) + s_real, s_imag + 1 (snr_map) , 1 distances, 2 correlated matrix (tx, rx)
+        input_channels = 2 + 2 + 1 + 1  # 8
 
         self.initial_conv = nn.Sequential(
             nn.Conv2d(input_channels, 32, kernel_size=1, padding=0), 
             nn.GroupNorm(8, 32),  # GroupNorm often works better than BatchNorm
-            nn.LeakyReLU(0.2),
+            nn.GELU()
             # nn.BatchNorm2d(32)
         )
         # Residual blocks
@@ -160,13 +169,6 @@ class SymbolLevelPrecodingNetwork(nn.Module):
             ResidualBlock(128, 192),
             ResidualBlock(192, 256)
         ])
-        self.res_block1 = ResidualBlock(32, 64)
-        self.res_block2 = ResidualBlock(64, 128)
-        self.res_block3 = ResidualBlock(128, 128)
-        # Deepen network
-        self.res_block4 = ResidualBlock(128, 192)
-        self.res_block5 = ResidualBlock(192, 256)
-        self.res_block6 = ResidualBlock(256, 256)
 
         self.spatial_feature_extractor = SpatialAttention(256)       
         self.channel_feature_extractor = ChannelAttention(256)
@@ -178,13 +180,11 @@ class SymbolLevelPrecodingNetwork(nn.Module):
         self.precoding_generator = nn.Sequential(
             nn.Flatten(),
             nn.Linear(256*self.num_users*self.num_users, 512),
-            nn.LeakyReLU(0.2),
+            nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(512, 1024),
-            nn.LeakyReLU(0.2),
-            # nn.Dropout(0.2),
-            # nn.Linear(1024, 2048),
-            nn.LeakyReLU(0.2),
+            nn.GELU(),
+            nn.Dropout(0.2),
             nn.Linear(1024, fc_output_size)  # Real and imag parts
         )
 
@@ -221,7 +221,45 @@ class SymbolLevelPrecodingNetwork(nn.Module):
 
         return snr_map
 
-    def forward(self, channel_state_info, symbols, snr_per_user):
+    def create_distance_map(self, channel_distances):
+        """Create spatial distance map for convolutional processing"""
+        batch_size = channel_distances.shape[0]
+        # Normalize distances to reasonable range
+        normalized_distances = channel_distances / (torch.max(channel_distances, dim=-1, keepdim=True)[0] + 1e-8)
+        distance_map = normalized_distances.unsqueeze(1)  # Add channel dimension
+        return distance_map
+    
+    def process_correlation_matrices(self, R_tx, R_rx):
+        """
+        Process spatial correlation matrices to extract useful features
+        
+        Args:
+            R_tx: Transmitter correlation matrix (batch_size, num_users, num_users)
+            R_rx: Receiver correlation matrix (batch_size, num_users, num_users)
+        Returns:
+            correlation_features: Processed correlation features for spatial mapping
+        """
+        batch_size = R_tx.shape[0]
+        
+        # Convert complex correlation matrices to real representation=
+        R_tx_real = R_tx
+        R_rx_real = R_rx
+        
+        # Flatten correlation matrices
+        R_tx_flat = R_tx_real.view(batch_size, -1)  # (batch, users*users)
+        R_rx_flat = R_rx_real.view(batch_size, -1)  # (batch, users*users)
+        
+        # Process through neural networks
+        tx_features = self.correlation_processor(R_tx_flat)  # (batch, users*users)
+        rx_features = self.correlation_processor(R_rx_flat)  # (batch, users*users)
+        
+        # Reshape to spatial maps
+        tx_corr_map = tx_features.view(batch_size, 1, self.num_users, self.num_users)
+        rx_corr_map = rx_features.view(batch_size, 1, self.num_users, self.num_users)
+        
+        return tx_corr_map, rx_corr_map
+
+    def forward(self, channel_state_info, symbols, snr_per_user, channel_distances, R_tx=None, R_rx=None):
         """
         Generate symbol-level precoding matrix based on channel state information and symbols
 
@@ -230,10 +268,16 @@ class SymbolLevelPrecodingNetwork(nn.Module):
             symbols: Symbol vector of shape (batch_size, num_users)
             channel_norm: Channel norm of shape (batch_size, 1, 1)
             snr_per_user: List of SNR values for each user (batch_size, num_users)
+            channel_distances: Distance between tx and rx (batch_size, num_users, num_users)
         Returns:
             torch.Tensor: Precoding matrix of shape (batch_size, num_users, num_users)
         """
         batch_size = channel_state_info.shape[0]
+
+        # NEW: Process correlation matrices if provided
+        if R_tx is not None and R_rx is not None:
+            # Process correlation matrices to spatial maps
+            tx_corr_map, rx_corr_map = self.process_correlation_matrices(R_tx, R_rx)
 
         # Convert channel info to real representation
         if torch.is_complex(channel_state_info):
@@ -266,10 +310,13 @@ class SymbolLevelPrecodingNetwork(nn.Module):
 
         # Convert snr_per_user to snr_map[i, i] = snr （batch_size, 1, num_users, num_users)
         snr_map = self.create_snr_map(snr_per_user)
+        distance_map = self.create_distance_map(channel_distances)
 
         # Concatenate along channel dimension
-        # x = torch.cat([h_real, h_imag, symbol_maps, snr_map], dim=1)
-        x = torch.cat([h_real, h_imag, s_real_expanded, s_imag_expanded, snr_map], dim=1)
+        # x = torch.cat([h_real, h_imag, s_real_expanded, s_imag_expanded, snr_map, 
+        #                distance_map, tx_corr_map, rx_corr_map], dim=1)
+        x = torch.cat([h_real, h_imag, snr_map, 
+                       distance_map, tx_corr_map, rx_corr_map], dim=1)
 
         # Feature extraction
         x = self.initial_conv(x)
@@ -300,7 +347,10 @@ class SymbolLevelPrecodingNetwork(nn.Module):
         if snr_per_user.dtype == torch.int64:
             snr_per_user = snr_per_user.float()
         avg_snr = torch.mean(snr_per_user, dim=1, keepdim=True).float()
-        power_target = 0.5 + 0.5 * self.snr_to_power(avg_snr)  # Range: [0.2, 1.0]
+        channel_var = torch.var(torch.abs(channel_state_info) ** 2, dim=(1,2)).unsqueeze(1)
+        power_input = torch.cat([avg_snr, channel_var], dim=1)
+        # power_target = 0.5 + 0.5 * self.snr_to_power(avg_snr)  # Range: [0.2, 1.0]
+        power_target = 0.5 + 0.5 * self.snr_to_power(power_input)
         
         # Normalize to learned power target
         current_power = torch.mean(torch.abs(precoding_matrix) ** 2, dim=(1, 2))
@@ -310,9 +360,6 @@ class SymbolLevelPrecodingNetwork(nn.Module):
         # Apply scaling but allow some flexibility
         # precoding_matrix = precoding_matrix * (0.8 * scaling + 0.2)
         precoding_matrix = precoding_matrix * torch.sqrt(scaling)
-
-        # Apply power constraint
-        # precoding_matrix = self.normalize_power(precoding_matrix)
 
         return precoding_matrix
 
@@ -346,7 +393,7 @@ class SymbolLevelPrecodingNetwork(nn.Module):
         # Randomly select symbols from constellation for each user in the batch
         indices = torch.randint(0, len(self.constellation_points), (batch_size, self.num_users))
         symbols = self.constellation_points[indices]
-        return symbols, indices
+        return symbols
 
     def compute_received_signals(self, precoding_matrix, symbols, channel_matrix, snr_db=20):
         """
@@ -441,18 +488,14 @@ class SymbolLevelPrecodingNetwork(nn.Module):
             #           - torch.abs(rotated_rec_symbols.imag)) * np.cos(math.pi/4)
 
             # distance_loss = torch.mean(m(distances1) + m(distances2))
-            distance_loss = (m(distances1) + m(distances2)).mean()
 
         elif self.constellation_size == 8:
             rotated_org_symbols = rotate_symbols_to_x_axis(original_symbols, original_symbols)
             rotated_rec_symbols = rotate_symbols_to_x_axis(normalized_received, original_symbols)
             distances1 = point_to_line_distance(rotated_rec_symbols, rotated_org_symbols)
             distances2 = point_to_line_distance(rotated_rec_symbols, rotated_org_symbols, -22.5)
-            # Determine distance sign, if inside, negative it
             distances2 = -distances2
 
-            # distance_loss = torch.mean(m(distances1) + m(distances2))
-            distance_loss = (m(distances1) + m(distances2)).mean()
             # print(f"rotated rec symbol = {rotated_rec_symbols} and rotated org symbol = {rotated_org_symbols}")
             # print(f"AB = {AB} and AR = {AR}")
             # print(f"distance 1: {distances1}")
@@ -477,44 +520,25 @@ class SymbolLevelPrecodingNetwork(nn.Module):
                     else:
                         distances1[b, u] = torch.abs(rotated_rec_symbols[b, u] - rotated_org_symbols[b, u])
 
-            # distance_loss = torch.mean(m(distances1) + m(distances2))
-            distance_loss = (m(distances1) + m(distances2)).mean()
+            # distance_loss = (m(distances1) + m(distances2)).mean()        # Old settings
 
-
-        return distance_loss
+        d_mj = torch.stack([distances1, distances2], dim=-1)
+        distance_loss = m(d_mj).mean()
+        lambda_var = 1
+        var_loss = 1/lambda_var * torch.var(d_mj)
+        # print(f"distance loss: {distance_loss}, var loss: {var_loss}")
+        
+        return distance_loss + var_loss
     
+    def loss_min_distance(self, d_mj):
+        flattened = d_mj.view(-1)
+        min_val = torch.min(flattened)
+        return -min_val
 
-    # def compute_constellation_distance_loss(self, received_signals, original_symbols):
-    #     """
-    #     Compute distance from ideal constellation points
-
-    #     Args:
-    #         received_signals: Received signals of shape (batch_size, num_users)
-    #         original_symbols: Original symbol vector of shape (batch_size, num_users)
-
-    #     Returns:
-    #         torch.Tensor: Average distance from ideal constellation points
-    #     """
-    #     original_power = torch.mean(torch.abs(original_symbols)**2, dim=-1, keepdim=True)
-    #     original_norm = original_symbols / torch.sqrt(original_power + 1e-8)
-
-    #     # Normalize received signals to match constellation scale
-    #     # First compute average power of received signals per user
-    #     avg_power = torch.mean(torch.abs(received_signals) ** 2, dim=0)
-
-    #     # Scale factor to normalize to unit power (same as constellation points)
-    #     scale_factor = 1.0 / torch.sqrt(avg_power + 1e-8)
-
-    #     # Normalize received signals
-    #     normalized_received = received_signals * scale_factor.unsqueeze(0)
-
-    #     # Calculate Euclidean distance in complex plane
-    #     distances = torch.abs(normalized_received - original_norm)
-
-    #     # Square error (MSE-like loss)
-    #     distance_loss = torch.mean(distances ** 2)
-
-    #     return distance_loss
+    def loss_softmin_distance(self, d_mj, gamma=10.0):
+        flattened = d_mj.view(-1)
+        softmin = - (1.0 / gamma) * torch.logsumexp(-gamma * flattened, dim=0)
+        return -softmin
 
     def compute_symbol_error_rate(self, received_signals, original_symbols):
         """
@@ -555,7 +579,7 @@ class SymbolLevelPrecodingNetwork(nn.Module):
 
         return ser
 
-def generate_AoD(num_samples, num_users, positions, f_MHz=2400):
+def generate_AoD(num_samples, num_users, positions, f_MHz=2400, mismatch_deg=None):
     distances = np.zeros((num_users, num_users))
     azimuth_angles = np.zeros((num_users, num_users))
     for i in range(num_users):
@@ -569,137 +593,95 @@ def generate_AoD(num_samples, num_users, positions, f_MHz=2400):
     # Total propagation phase (2π * distance / wavelength)
     wavelength = 3e8 / (f_MHz * 1e6)
     propagation_phase = 2 * np.pi * distances / wavelength
-    # Polarization mismatch angle
-    geo_phase = np.random.uniform(-5, 5, size=(num_users, num_users)) * np.pi / 180
-    phase = propagation_phase + geo_phase
-
-    return phase, distances
-
-def generate_channel_data(num_samples, num_users, k_factor_dB=0, mode='rician'):
-    """
-    Generate channel coefficient for rician channel
-    Args:
-        num_samples: number of batch size
-        num_users: number of users
-        phase: phase of the channel
-        path_loss_dB: received path loss in dB
-        k_factor_dB: control contribution for LOS annd NLOS k = 0, LOS 1/2, NLOS 1/2
-    Returns:
-        torch.Tensor: Normalized channel matrices of shape (num_samples, num_users, num_users)
-        torch.Tensor: Channel norms of shape (num_samples, 1, 1)
-    """
-    # Parameters
-    f_MHz = 2400  # in MHz
-    positions = np.array([
-        [0, 0],
-        [400, 150],
-        [120, 400]
-        ])
-    alpha = 2.5
-    G_T = 20   # antenna gain
-    phase, distances = generate_AoD(num_samples, num_users, positions, f_MHz=f_MHz)
-
-    d_km = distances / 1000
-    d_km[d_km==0] = 0.4
-    path_loss_dB = 32.44 + 10 * alpha * np.log10(f_MHz) + 10 * alpha * np.log10(d_km) - 2*G_T
-    path_loss_linear = 10 ** (path_loss_dB / 10)
-    path_loss_factor = torch.tensor(1 / np.sqrt(path_loss_linear))
-
-    if mode == 'rician':
-        K = 10 ** (k_factor_dB / 10)  # Convert K from dB to linear
-        # LOS component with deterministic phase
-        los_mag = torch.sqrt(torch.tensor(K / (K + 1)))
-        los_component = los_mag * np.exp(1j * phase)
-        # NLOS component
-        nlos_mag = torch.sqrt(torch.tensor(1 / (K + 1)))
-
-        # Generate complex Gaussian random variables (X+jY)
-        X = torch.normal(0.0, np.sqrt(1/2), size=(num_samples, num_users, num_users))
-        Y = torch.normal(0.0, np.sqrt(1/2), size=(num_samples, num_users, num_users))
-        scatter_component = (X + 1j * Y)
-
-        # Combine LoS and scattered components
-        fading = los_component + nlos_mag * scatter_component
-        h = path_loss_factor * fading
-        h = h.to(torch.complex64)
+    if mismatch_deg is None:
+        # Training: no mismatch
+        # Polarization mismatch angle
+        phase = propagation_phase
     else:
-        raise ValueError(f"Unknown channel mode: {mode}")
+        # Testing: controlled mismatch, constant antenna mismatch
+        geo_phase = np.full((num_users, num_users), mismatch_deg * np.pi / 180)
+        # geo_phase = np.random.uniform(-5, 5, size=(num_users, num_users)) * np.pi / 180
+        phase = propagation_phase + geo_phase
 
-    h_power = torch.mean(torch.abs(h) ** 2, dim=(1, 2), keepdim=True)
-    return h / torch.sqrt(h_power + 1e-8), torch.sqrt(h_power)
+    return phase, distances, propagation_phase
 
-# def generate_channel_data(num_samples, num_users, mode='rayleigh'):
+# def generate_channel_data(num_samples, num_users, k_factor_dB=0, mode='rician'):
 #     """
-#     Generate channel state information data
-
+#     Generate channel coefficient for rician channel
 #     Args:
-#         num_samples: Number of samples
-#         num_users: Number of users
-#         mode: Channel model ('rayleigh' or '
-        
-#         ')
-
+#         num_samples: number of batch size
+#         num_users: number of users
+#         phase: phase of the channel
+#         path_loss_dB: received path loss in dB
+#         k_factor_dB: control contribution for LOS annd NLOS k = 0, LOS 1/2, NLOS 1/2
 #     Returns:
-#         torch.Tensor: Channel matrices of shape (num_samples, num_users, num_users)
+#         torch.Tensor: Normalized channel matrices of shape (num_samples, num_users, num_users)
+#         torch.Tensor: Channel norms of shape (num_samples, 1, 1)
 #     """
 #     # Parameters
 #     f_MHz = 2400  # in MHz
-#     d_km = 0.05   # in kilo-meters
+#     positions = np.array([
+#         [0, 0],
+#         [400, 150],
+#         [120, 400]
+#         ])
 #     alpha = 2.5
 #     G_T = 20   # antenna gain
-#     path_loss_dB = 32.44 + 10 * alpha * np.log10(f_MHz) + 10 * alpha * np.log10(d_km) - 2*G_T
+#     phase, distances, original_phase = generate_AoD(num_samples, num_users, positions, f_MHz=f_MHz)
 
-#     if mode == 'rayleigh':
-#         # Rayleigh fading channel
-#         h_real = torch.randn(num_samples, num_users, num_users) / np.sqrt(2)
-#         h_imag = torch.randn(num_samples, num_users, num_users) / np.sqrt(2)
-#         h = torch.complex(h_real, h_imag)
-#     elif mode == 'rician':
-#          # Convert path loss from dB to linear
-#         path_loss_linear = 10 ** (path_loss_dB / 10)
-#         path_loss_factor = 1 / np.sqrt(path_loss_linear)
-#         # Rician fading channel with K-factor = 1
-#         k_factor_dB = 0.0  # Weak LOS 1/2 LOS, 1/2 NLOS
+#     d_km = distances / 1000
+#     d_km[d_km==0] = 0.4
+#     path_loss_dB = 32.44 + 10 * alpha * np.log10(f_MHz) + 10 * alpha * np.log10(d_km) - 2*G_T
+#     path_loss_linear = 10 ** (path_loss_dB / 10)
+#     path_loss_factor = torch.tensor(1 / np.sqrt(path_loss_linear))
+
+#     if mode == 'rician':
 #         K = 10 ** (k_factor_dB / 10)  # Convert K from dB to linear
-#         # LOS component
+#         # LOS component with deterministic phase
 #         los_mag = torch.sqrt(torch.tensor(K / (K + 1)))
+#         los_component = los_mag * np.exp(1j * phase)
 #         # NLOS component
 #         nlos_mag = torch.sqrt(torch.tensor(1 / (K + 1)))
 
 #         # Generate complex Gaussian random variables (X+jY)
-#         X = torch.normal(0.0, 0.5, size=(num_samples, num_users, num_users))
-#         Y = torch.normal(0.0, 0.5, size=(num_samples, num_users, num_users))
-#         scatter_component = X + 1j * Y
+#         X = torch.normal(0.0, np.sqrt(1/2), size=(num_samples, num_users, num_users))
+#         Y = torch.normal(0.0, np.sqrt(1/2), size=(num_samples, num_users, num_users))
+#         scatter_component = (X + 1j * Y)
 
 #         # Combine LoS and scattered components
-#         fading = los_mag + nlos_mag * scatter_component
+#         fading = los_component + nlos_mag * scatter_component
 #         h = path_loss_factor * fading
-#     elif mode == 'path_loss':
-#         path_loss_linear = 10 ** (path_loss_dB / 10)
-#         path_loss_factor = 1 / np.sqrt(path_loss_linear)
-#         phase = torch.distributions.Uniform(0, np.pi).sample((num_samples, num_users, num_users))   # limited phase from 0 to pi
-#         h = path_loss_factor * np.exp(1j * phase)
+#         h = h.to(torch.complex64)
 #     else:
 #         raise ValueError(f"Unknown channel mode: {mode}")
 
-#     h_power = torch.mean(torch.abs(h) ** 2, dim=(1, 2), keepdim=True) 
+#     h_power = torch.mean(torch.abs(h) ** 2, dim=(1, 2), keepdim=True)
 #     return h / torch.sqrt(h_power + 1e-8), torch.sqrt(h_power)
+
 
 def train_symbol_level_precoding_network(snr_db_range=(0.0, 31.0)):
     # Parameters
-    num_users = 3
-    constellation_size = 16
-    batch_size = 64
-    num_epochs = 100
+    num_users = 2
+    constellation_size = 4
+    batch_size = 128
+    num_epochs = 80
     learning_rate = 0.001
     k_factor_dB = 10
+    tx_init = np.array([[0, 0], [100, 0]])
+    rx_init = np.array([[100, 200], [210, 110]])
+
+    # tx_init = np.array([[0, 0], [100, 0], [200, 0]])
+    # rx_init = np.array([[400, 120], [510, 110], [420, 210]])
 
     # Generate training data
     num_train_samples = 10000
-    channel_matrices, channel_norm = generate_channel_data(num_train_samples, num_users, k_factor_dB, mode='rician')
+    # channel_matrices, channel_distances = generate_channel_data(num_train_samples, num_users, k_factor_dB, mode='rician')
+    channel_matrices, channel_distances, R_tx, R_rx  = generate_channel_data(num_train_samples, tx_init, rx_init, 
+                                                            velocities=0, vibration_std=10,
+                                                           k_factor_dB=k_factor_dB, mode='rician')
 
     # Create dataset and dataloader
-    train_dataset = TensorDataset(channel_matrices, channel_norm)
+    train_dataset = TensorDataset(channel_matrices, channel_distances, R_tx, R_rx)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     # Initialize network
@@ -716,7 +698,7 @@ def train_symbol_level_precoding_network(snr_db_range=(0.0, 31.0)):
         epoch_ser = 0.0
         num_batches = 0
 
-        for channel_batch, channel_norm_batch in train_loader:
+        for channel_batch, distances_batch, Rho_tx, Rho_rx in train_loader:
             channels = channel_batch
             batch_size = channels.shape[0]
 
@@ -730,14 +712,14 @@ def train_symbol_level_precoding_network(snr_db_range=(0.0, 31.0)):
             snr_db = np.mean(snr_per_sample)  # For logging
 
             # Generate random symbols for each user
-            symbols, _ = model.generate_symbols(batch_size)
+            symbols = model.generate_symbols(batch_size)
 
             # Zero gradients
             optimizer.zero_grad()
 
 
             # Forward pass: generate symbol-level precoding matrix
-            precoding_matrix = model(channels, symbols, snr_per_user)
+            precoding_matrix = model(channels, symbols, snr_per_user, distances_batch, Rho_tx, Rho_rx)
 
             # Compute received signals
             # received_signals not normal
@@ -797,7 +779,26 @@ def train_symbol_level_precoding_network(snr_db_range=(0.0, 31.0)):
 
     return model, loss_history, ser_history
 
-def test_symbol_level_precoding(model, snr_db_list=None):
+def val_symbol_level_precoding(model):
+    # Parameters
+    num_users = 2
+    constellation_size = 4
+    batch_size = 128
+    num_epochs = 80
+    learning_rate = 0.001
+    k_factor_dB = 10
+    tx_init = np.array([[0, 0], [100, 0]])
+    rx_init = np.array([[100, 200], [210, 110]])
+    snr_db_range=(0.0, 31.0)
+    
+    num_val_samples = 2000
+    val_channel_matrices, val_channel_distances, val_R_tx, val_R_rx = generate_channel_data(
+        num_val_samples, tx_init, rx_init, 
+        velocities=0, vibration_std=10,
+        k_factor_dB=k_factor_dB, mode='rician'
+    )
+
+def test_symbol_level_precoding(model, tx_init, rx_init, snr_db_list=None):
     """
     Test the symbol-level precoding model at different SNR levels
     """
@@ -810,12 +811,14 @@ def test_symbol_level_precoding(model, snr_db_list=None):
     k_factor_dB = 10
 
     # Generate test data
-    test_channels, channel_norm = generate_channel_data(num_test_samples, num_users, k_factor_dB, mode='rician')
+    # test_channels, channel_norm = generate_channel_data(num_test_samples, num_users, k_factor_dB, mode='rician')
+    test_channels, channel_distances, R_tx, R_rx = generate_channel_data(num_test_samples, tx_init, rx_init, 
+                                                            velocities=0, vibration_std=10,
+                                                           k_factor_dB=k_factor_dB, mode='rician')
 
     # Results storage
     sl_ser_results = []
     zf_ser_results = []
-    uncoded_ser_results = []
     rzf_ser_results = []
     loss_history = []
 
@@ -827,7 +830,6 @@ def test_symbol_level_precoding(model, snr_db_list=None):
         sl_symbol_errors = 0
         sl_total_symbols = 0
         epoch_loss = 0
-        batch_count = 0
 
         with torch.no_grad():
             for i in range(0, num_test_samples, 32):
@@ -835,14 +837,16 @@ def test_symbol_level_precoding(model, snr_db_list=None):
                 end_idx = min(i + 32, num_test_samples)
                 batch_size = end_idx - i
                 channels_batch = test_channels[i:end_idx]
-                channel_norm_batch = channel_norm[i:end_idx]
+                dist_batch = channel_distances[i:end_idx]
+                Rho_tx = R_tx[i:end_idx]
+                Rho_rx = R_rx[i:end_idx]
 
                 # Generate random symbols
-                symbols, _ = model.generate_symbols(batch_size)
+                symbols = model.generate_symbols(batch_size)
 
                 # Generate symbol-level precoding matrix
                 snr_per_user = torch.tensor(snr_db, dtype=torch.float32).repeat(batch_size, num_users)
-                precoding_matrix = model(channels_batch, symbols, snr_per_user)
+                precoding_matrix = model(channels_batch, symbols, snr_per_user, dist_batch, Rho_tx, Rho_rx)
 
                 # Compute received signals
                 snr_array = np.full(batch_size, snr_db)
@@ -880,7 +884,7 @@ def test_symbol_level_precoding(model, snr_db_list=None):
             channels_batch = test_channels[i:end_idx]
 
             # Generate random symbols
-            symbols, original_indices = model.generate_symbols(batch_size)
+            symbols = model.generate_symbols(batch_size)
 
             # ZF precoding matrices
             zf_precoding_matrices = []
@@ -980,7 +984,7 @@ def test_symbol_level_precoding(model, snr_db_list=None):
             end_idx = min(i + 32, num_test_samples)
             batch_size = end_idx - i
             channels_batch = test_channels[i:end_idx]
-            symbols, original_indices = model.generate_symbols(batch_size)
+            symbols = model.generate_symbols(batch_size)
 
             rzf_precoding_matrices = []
 
@@ -1068,26 +1072,31 @@ def test_symbol_level_precoding(model, snr_db_list=None):
 
     return sl_ser_results, zf_ser_results, loss_history
 
-def visualize_constellation(model, snr_db=10):
+def visualize_constellation(model, tx_init, rx_init, snr_db=10):
     """
     Visualize received constellation points for symbol-level precoding
     """
     num_users = model.num_users
     num_samples = 500
     noise_power = 10 ** (-snr_db / 10)
+    k_factor_dB = 10.0
 
     # Generate channel matrices
-    channels, _ = generate_channel_data(num_samples, num_users, mode='rician')
+    # channels, channel_distances = generate_channel_data(num_samples, num_users, k_factor_dB, mode='rician')
+    channels, channel_distances, R_tx, R_rx = generate_channel_data(num_samples, tx_init, rx_init, 
+                                                            velocities=0, vibration_std=5,
+                                                           k_factor_dB=k_factor_dB, mode='rician')
+
 
     # Generate random symbols
-    symbols, _ = model.generate_symbols(num_samples)
+    symbols = model.generate_symbols(num_samples)
 
     snr_per_user = torch.tensor(snr_db).repeat(num_samples, num_users)
 
     # Generate symbol-level precoding matrices
     model.eval()
     with torch.no_grad():
-        precoding_matrices = model(channels, symbols, snr_per_user)
+        precoding_matrices = model(channels, symbols, snr_per_user, channel_distances, R_tx, R_rx)
 
     # Compute received signals
     received_signals = model.compute_received_signals(
@@ -1100,7 +1109,7 @@ def visualize_constellation(model, snr_db=10):
     normalized_received = received_signals * scale_factor.unsqueeze(0)
 
     # Plot constellation for each user
-    plt.figure(figsize=(16, 12))
+    plt.figure(figsize=(16, 8))
 
     for u in range(min(num_users, 4)):  # Plot up to 4 users
         plt.subplot(2, 2, u+1)
@@ -1181,15 +1190,20 @@ def point_to_line_distance(point, line_start, angle_degrees=45):
 if __name__ == "__main__":
     # Train the model
     model, loss_history, ser_history = train_symbol_level_precoding_network()
-    torch.save(model.state_dict(), './saved_models/model_weights3_4_3user_16QAM.pth')
+    torch.save(model.state_dict(), './saved_models/model_weights4_1_corr_2user_static_4QAM.pth')
     print("Model saved successfully!")
 
+    tx_init = np.array([[0, 0], [130, 20]])      # dist = [245, 255]
+    rx_init = np.array([[70, 50], [120, 110]])
+
     # Test at different SNR levels
-    sl_ser, zf_ser, loss_hist = test_symbol_level_precoding(model)
+    # tx_init = np.array([[70, 70], [120, 50]])      # dist = [281, 380]
+    # rx_init = np.array([[350, 40], [470, 200]])
+    sl_ser, zf_ser, loss_hist = test_symbol_level_precoding(model, tx_init=tx_init, rx_init=rx_init)
 
     # Compare Loss
     # Plot training history
-    plt.figure(figsize=(10, 4))
+    plt.figure(figsize=(10,4))
 
     plt.subplot(1, 2, 1)
     plt.plot(loss_history)
@@ -1207,6 +1221,6 @@ if __name__ == "__main__":
     plt.show()
 
     # Visualize constellation
-    visualize_constellation(model, snr_db=15)
+    visualize_constellation(model, tx_init=tx_init, rx_init=rx_init)
 
     # # print(model)
