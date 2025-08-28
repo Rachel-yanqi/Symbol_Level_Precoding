@@ -13,7 +13,7 @@ The `requirements.txt` file should list all Python libraries for this project, a
 ```bash
 pip install -r requirements.txt
 ```
-Train the model and save the model weights using:
+Customize hyperparameters in `specs_dict.py` file. Train the model and save the model weights using:
 ```bash
 python Tx_encoder.py
 ```
