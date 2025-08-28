@@ -2,6 +2,14 @@ import numpy as np
 import torch
 from scipy.spatial.distance import cdist
 import sys
+from specs_dict import specs_dict as specs
+
+def update_specs_dict(specs):
+    velocities = specs["channel_data"]["velocities"]
+    vibration_std = specs["channel_data"]["vibration_std"]
+    mode = specs["channel_data"]["type"]
+
+    return velocities, vibration_std, mode
 
 def generate_channel_data(num_time_steps, tx_init, rx_init,
                           velocities=50, vibration_std=10, area_size=200, k_factor_dB=10, 
@@ -22,6 +30,7 @@ def generate_channel_data(num_time_steps, tx_init, rx_init,
         rho_temporal: Temporal correlation coefficient (0-1)
     """
     num_users = rx_init.shape[0]
+    velocities, vibration_std, mode = update_specs_dict(specs)
 
     def compute_path_loss(tx_positions, rx_positions, mismatch_deg=None):
         # Compute path loss between all tx-rx pairs

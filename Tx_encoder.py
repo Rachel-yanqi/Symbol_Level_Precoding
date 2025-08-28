@@ -4,6 +4,8 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
+from pathlib import Path
+from specs_dict import specs_dict as specs
 from generate_corr_csi import generate_channel_data
 torch.manual_seed(42)
 
@@ -350,6 +352,11 @@ class SymbolLevelPrecodingNetwork(nn.Module):
         channel_var = torch.var(torch.abs(channel_state_info) ** 2, dim=(1,2)).unsqueeze(1)
         power_input = torch.cat([avg_snr, channel_var], dim=1)
         # power_target = 0.5 + 0.5 * self.snr_to_power(avg_snr)  # Range: [0.2, 1.0]
+        """ 
+        ===================================
+        power scalaring is dfferent for constellations 16QAM (higher order QAM)
+        we need to adjust power scalaring based on symbol. Inner constellations should have lower power 
+        """ 
         power_target = 0.5 + 0.5 * self.snr_to_power(power_input)
         
         # Normalize to learned power target
@@ -661,20 +668,24 @@ def generate_AoD(num_samples, num_users, positions, f_MHz=2400, mismatch_deg=Non
 
 def train_symbol_level_precoding_network(snr_db_range=(0.0, 31.0)):
     # Parameters
-    num_users = 2
-    constellation_size = 4
-    batch_size = 128
-    num_epochs = 80
-    learning_rate = 0.001
-    k_factor_dB = 10
-    tx_init = np.array([[0, 0], [100, 0]])
-    rx_init = np.array([[100, 200], [210, 110]])
+    num_users = specs["num_users"]
+    constellation_size = specs["constellation_size"]
+    batch_size = specs["training_opt"]["batch_size"]
+    num_epochs = specs["training_opt"]["num_epochs"]
+    learning_rate = specs["training_opt"]["learning_rate"]
+    k_factor_dB = specs["channel_data"]["k_factor_db"]
+    tx_init = np.array(specs["tx_init"])
+    rx_init = np.array(specs["rx_init"])
 
     # tx_init = np.array([[0, 0], [100, 0], [200, 0]])
     # rx_init = np.array([[400, 120], [510, 110], [420, 210]])
 
+    # Optimizer parameters 
+    step_size = specs["training_opt"]["step_size"]
+    gamma = specs["training_opt"]["gamma"]
+
     # Generate training data
-    num_train_samples = 10000
+    num_train_samples = specs["num_samples"]
     # channel_matrices, channel_distances = generate_channel_data(num_train_samples, num_users, k_factor_dB, mode='rician')
     channel_matrices, channel_distances, R_tx, R_rx  = generate_channel_data(num_train_samples, tx_init, rx_init, 
                                                             velocities=0, vibration_std=10,
@@ -687,7 +698,7 @@ def train_symbol_level_precoding_network(snr_db_range=(0.0, 31.0)):
     # Initialize network
     model = SymbolLevelPrecodingNetwork(num_users=num_users, constellation_size=constellation_size)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
 
     # Training loop
     loss_history = []
@@ -1190,7 +1201,10 @@ def point_to_line_distance(point, line_start, angle_degrees=45):
 if __name__ == "__main__":
     # Train the model
     model, loss_history, ser_history = train_symbol_level_precoding_network()
-    torch.save(model.state_dict(), './saved_models/model_weights4_1_corr_2user_static_4QAM.pth')
+    file_path = Path(specs["training_opt"]["file_path"])
+    file_path.parent.mkdir(parents=True, exist_ok=True) 
+    torch.save(model.state_dict(), str(file_path))
+    # torch.save(model.state_dict(), './saved_models/model_weights4_1_corr_2user_static_4QAM.pth')
     print("Model saved successfully!")
 
     tx_init = np.array([[0, 0], [130, 20]])      # dist = [245, 255]
